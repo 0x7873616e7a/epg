@@ -1,0 +1,335 @@
+name: Grab EPG
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download API data
+        run: npm run api:load
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: public/
+          key: epg-${{ runner.os }}-${{ hashFiles('.github/workflows/grab-epg.yml') }}-${{ github.run_number }}
+          restore-keys: |
+            epg-${{ runner.os }}-${{ hashFiles('.github/workflows/grab-epg.yml') }}-
+            epg-${{ runner.os }}-
+
+      - name: Prepare output folder
+        run: |
+          mkdir -p public
+          touch /tmp/failed_sites.txt
+          echo "Cache contents:"
+          ls -lh public/ 2>/dev/null || echo "(empty)"
+
+      - name: Grab all sites
+        run: |
+          grab_site() {
+            local SITE=$1
+            local OUTPUT="public/$2"
+            local LANG=$3
+            local EXTRA=""
+            [ -n "$LANG" ] && EXTRA="--lang=$LANG"
+
+            echo "Grabbing $SITE..."
+            if npm run grab -- --site=$SITE --days=3 $EXTRA --output=$OUTPUT 2>&1 && [ -s "$OUTPUT" ]; then
+              echo "$SITE done ($(wc -c < $OUTPUT) bytes)"
+            else
+              echo "$SITE failed"
+              echo "$SITE|$OUTPUT|$LANG" >> /tmp/failed_sites.txt
+            fi
+          }
+
+          # Baca sites.config.json dan grab tiap site
+          jq -c '.[]' sites.config.json | while IFS= read -r entry; do
+            SITE=$(echo "$entry" | jq -r '.site')
+            OUTPUT=$(echo "$entry" | jq -r '.output')
+            LANG=$(echo "$entry" | jq -r '.lang')
+            grab_site "$SITE" "$OUTPUT" "$LANG"
+          done
+
+          echo ""
+          echo "Failed sites: $(wc -l < /tmp/failed_sites.txt)"
+          cat /tmp/failed_sites.txt || true
+
+      - name: Retry failed sites (max 3x)
+        run: |
+          retry_failed() {
+            local ATTEMPT=$1
+            local RETRY_FILE="/tmp/failed_sites.txt"
+            local NEXT="/tmp/failed_sites_next.txt"
+            > "$NEXT"
+
+            [ ! -s "$RETRY_FILE" ] && return 0
+
+            echo "Retry attempt $ATTEMPT/3"
+            cat "$RETRY_FILE"
+            echo "Waiting 30s..."
+            sleep 30
+
+            while IFS='|' read -r SITE OUTPUT LANG; do
+              [ -z "$SITE" ] && continue
+              EXTRA=""
+              [ -n "$LANG" ] && EXTRA="--lang=$LANG"
+              if npm run grab -- --site=$SITE --days=3 $EXTRA --output=$OUTPUT 2>&1 && [ -s "$OUTPUT" ]; then
+                echo "$SITE OK on attempt $ATTEMPT"
+              else
+                echo "$SITE still failing"
+                echo "$SITE|$OUTPUT|$LANG" >> "$NEXT"
+              fi
+            done < "$RETRY_FILE"
+
+            mv "$NEXT" "$RETRY_FILE"
+          }
+
+          for i in 1 2 3; do
+            [ ! -s /tmp/failed_sites.txt ] && echo "All sites OK" && break
+            retry_failed $i
+          done
+
+          if [ -s /tmp/failed_sites.txt ]; then
+            echo "Still failing after 3 retries:"
+            cat /tmp/failed_sites.txt
+          else
+            echo "All sites grabbed successfully"
+          fi
+
+      - name: Apply fallback from cache
+        run: |
+          EMPTY='<?xml version="1.0" encoding="UTF-8"?><tv generator-info-name="epg"></tv>'
+
+          apply_fallback() {
+            local FILE="public/$1"
+            local CACHE="public/.cache.$1"
+
+            if [ -s "$FILE" ]; then
+              cp "$FILE" "$CACHE"
+            elif [ -s "$CACHE" ]; then
+              echo "Using cached version for $FILE"
+              cp "$CACHE" "$FILE"
+            else
+              echo "No data for $FILE, writing empty XML"
+              echo "$EMPTY" > "$FILE"
+            fi
+          }
+
+          jq -r '.[].output' sites.config.json | while read -r OUTPUT; do
+            apply_fallback "$OUTPUT"
+          done
+
+          echo ""
+          jq -r '.[].output' sites.config.json | while read -r OUTPUT; do
+            echo "public/$OUTPUT: $(wc -c < public/$OUTPUT) bytes"
+          done
+
+      - name: Build index page
+        run: |
+          # worker.json — pakai output pertama dari config sebagai guide utama
+          FIRST_OUTPUT=$(jq -r '.[0].output' sites.config.json)
+          cat > public/worker.json << EOF
+          {
+            "channels": "channels.xml",
+            "guide": "${FIRST_OUTPUT}"
+          }
+          EOF
+
+          get_status() {
+            local FILE="public/$1"
+            local CACHE="public/.cache.$1"
+            if [ ! -s "$FILE" ]; then
+              echo "No data"
+            elif diff -q "$FILE" "$CACHE" > /dev/null 2>&1; then
+              echo "Cached"
+            else
+              echo "Fresh"
+            fi
+          }
+
+          UPDATED=$(date -u '+%Y-%m-%d %H:%M UTC')
+          PAGES_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)"
+
+          jq -c '.[]' sites.config.json | while IFS= read -r entry; do
+            SITE=$(echo "$entry" | jq -r '.site')
+            OUTPUT=$(echo "$entry" | jq -r '.output')
+            STATUS=$(get_status "$OUTPUT")
+            CSS="fresh"
+            [ "$STATUS" = "Cached" ] && CSS="cached"
+            [ "$STATUS" = "No data" ] && CSS="nodata"
+            URL="${PAGES_URL}/${OUTPUT}"
+            echo "<tr><td>${SITE}</td><td class=\"${CSS}\">${STATUS}</td><td><code>${URL}</code></td><td><a href=\"${URL}\" target=\"_blank\" class=\"btn\">View</a> <a href=\"${URL}\" download class=\"btn btn-dl\">Download</a></td></tr>"
+          done > /tmp/table_rows.html
+
+          cat > public/index.html << EOF
+          <!DOCTYPE html>
+          <html lang="id">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>EPG Indonesia</title>
+            <style>
+              body { font-family: sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; }
+              h1 { color: #1a73e8; }
+              table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+              th, td { padding: 10px 14px; border: 1px solid #ddd; text-align: left; vertical-align: middle; }
+              th { background: #f5f5f5; }
+              code { background: #eee; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; word-break: break-all; cursor: pointer; }
+              code:hover { background: #ddd; }
+              .fresh  { color: #34a853; font-weight: bold; }
+              .cached { color: #f9ab00; font-weight: bold; }
+              .nodata { color: #ea4335; font-weight: bold; }
+              .btn { display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 0.8em; text-decoration: none; margin-right: 4px; }
+              .btn { background: #1a73e8; color: white; }
+              .btn:hover { background: #1558b0; }
+              .btn-dl { background: #34a853; }
+              .btn-dl:hover { background: #267a3c; }
+              .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 10px 20px; border-radius: 6px; font-size: 0.9em; display: none; }
+            </style>
+          </head>
+          <body>
+            <h1>EPG Indonesia</h1>
+            <p>Updated: <strong>${UPDATED}</strong></p>
+            <h2>EPG Sources</h2>
+            <table>
+              <tr><th>Source</th><th>Status</th><th>URL</th><th>Actions</th></tr>
+          $(cat /tmp/table_rows.html)
+            </table>
+            <p style="font-size:0.85em;color:#666;">Click on URL to copy to clipboard.</p>
+            <h2>How to use</h2>
+            <ol>
+              <li>Click the URL to copy, then paste in your IPTV player</li>
+              <li>TiviMate: Settings &rarr; EPG sources &rarr; Add URL</li>
+              <li>KODI: PVR IPTV Simple Client &rarr; EPG URL</li>
+            </ol>
+            <div class="toast" id="toast">Copied to clipboard!</div>
+            <script>
+              document.querySelectorAll('code').forEach(el => {
+                el.title = 'Click to copy';
+                el.addEventListener('click', () => {
+                  navigator.clipboard.writeText(el.textContent).then(() => {
+                    const toast = document.getElementById('toast');
+                    toast.style.display = 'block';
+                    setTimeout(() => toast.style.display = 'none', 2000);
+                  });
+                });
+              });
+            </script>
+          </body>
+          </html>
+          EOF
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Update Release
+        run: |
+          BASE="${{ steps.deployment.outputs.page_url }}"
+          UPDATED=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          # Build status changelog per site
+          CHANGELOG=""
+          while IFS= read -r entry; do
+            SITE=$(echo "$entry" | jq -r '.site')
+            OUTPUT=$(echo "$entry" | jq -r '.output')
+            FILE="public/${OUTPUT}"
+            CACHE="public/.cache.${OUTPUT}"
+            if [ ! -s "$FILE" ]; then
+              STATUS="❌ No data"
+            elif diff -q "$FILE" "$CACHE" > /dev/null 2>&1; then
+              STATUS="🟡 Cached (no change)"
+            else
+              STATUS="✅ Fresh"
+            fi
+            CHANGELOG="${CHANGELOG}\n| ${SITE} | ${STATUS} | [${OUTPUT}](${BASE}${OUTPUT}) |"
+          done < <(jq -c '.[]' sites.config.json)
+
+          cat > /tmp/release_body.md << NOTES
+          ## EPG Indonesia — TV Guide XML
+
+          File EPG diperbarui otomatis **4x sehari** (00:00, 06:00, 12:00, 18:00 UTC).
+          Gunakan URL di bawah langsung di IPTV player kamu (TiviMate, KODI, dsb).
+
+          **🕒 Terakhir diperbarui:** ${UPDATED}
+          **🔗 Pages URL:** ${BASE}
+
+          ---
+
+          ## 📋 Daftar EPG
+
+          | Site | Status | File |
+          |------|--------|------|
+          $(echo -e "${CHANGELOG}")
+
+          ---
+
+          ## 📝 Changelog Run ini
+
+          - Run: [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - Waktu: ${UPDATED}
+          $(echo -e "${CHANGELOG}" | sed 's/^/- /')
+
+          ---
+
+          ## ❓ Cara Pakai
+
+          1. Copy URL file XML di kolom **File** atas
+          2. **TiviMate:** Settings → EPG sources → Add URL
+          3. **KODI:** PVR IPTV Simple Client → EPG URL
+          4. **VLC / MX Player:** Tidak perlu EPG
+
+          > ℹ️ Status **Cached** berarti data hari ini belum berubah dari sebelumnya, bukan berarti gagal.
+          NOTES
+
+          # Cek apakah release "EPG" sudah ada
+          if gh release view "EPG" > /dev/null 2>&1; then
+            echo "Release 'EPG' exists — editing..."
+            gh release edit "EPG" \
+              --title "EPG" \
+              --notes-file /tmp/release_body.md
+          else
+            echo "Release 'EPG' not found — creating..."
+            gh release create "EPG" \
+              --title "EPG" \
+              --notes-file /tmp/release_body.md \
+              --latest
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Done
+        run: |
+          BASE="${{ steps.deployment.outputs.page_url }}"
+          echo "URL: $BASE"
+          jq -r '.[] | "\(.site): '"$BASE"'\(.output)"' sites.config.json
