@@ -1,0 +1,32 @@
+[
+  {
+    "site": "indihometv.com",
+    "output": "guide-indihome.xml",
+    "lang": ""
+  },
+  {
+    "site": "firstmedia.com",
+    "output": "guide-firstmedia.xml",
+    "lang": ""
+  },
+  {
+    "site": "visionplus.id",
+    "output": "guide-visionplus.xml",
+    "lang": ""
+  },
+  {
+    "site": "dens.tv",
+    "output": "guide-dens.xml",
+    "lang": ""
+  },
+  {
+    "site": "vidio.com",
+    "output": "guide-vidio.xml",
+    "lang": ""
+  },
+  {
+    "site": "cubmu.com",
+    "output": "guide-cubmu.xml",
+    "lang": ""
+  }
+]
